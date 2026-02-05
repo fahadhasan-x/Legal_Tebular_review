@@ -1,0 +1,189 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: legal-review-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-legal_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legal_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-legal_review}
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    ports:
+      - "5436:5432"  # Custom port to avoid conflicts
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-legal_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - legal-review-network
+
+  # Redis (Cache + Celery Broker)
+  redis:
+    image: redis:7-alpine
+    container_name: legal-review-redis
+    ports:
+      - "6383:6379"  # Custom port to avoid conflicts
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - legal-review-network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: legal-review-backend
+    ports:
+      - "8004:8000"  # Custom port to avoid conflicts
+    environment:
+      # Database
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-legal_user}:${POSTGRES_PASSWORD:-legal_pass}@postgres:5432/${POSTGRES_DB:-legal_review}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-legal_user}:${POSTGRES_PASSWORD:-legal_pass}@postgres:5432/${POSTGRES_DB:-legal_review}
+      
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      
+      # AI/LLM
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      
+      # Application
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      
+      # Storage
+      UPLOAD_DIR: /data/uploads
+      MAX_UPLOAD_SIZE: 52428800  # 50MB
+      
+      # CORS
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3004,http://127.0.0.1:3004}
+    volumes:
+      - ./backend:/app
+      - ./data:/data
+      - uploads_data:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "
+        echo 'Waiting for database...' &&
+        python -c 'import time; time.sleep(5)' &&
+        echo 'Running migrations...' &&
+        alembic upgrade head &&
+        echo 'Starting FastAPI server...' &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --log-level info
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - legal-review-network
+
+  # Celery Worker
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: legal-review-celery-worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-legal_user}:${POSTGRES_PASSWORD:-legal_pass}@postgres:5432/${POSTGRES_DB:-legal_review}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-legal_user}:${POSTGRES_PASSWORD:-legal_pass}@postgres:5432/${POSTGRES_DB:-legal_review}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      UPLOAD_DIR: /data/uploads
+    volumes:
+      - ./backend:/app
+      - ./data:/data
+      - uploads_data:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "
+        echo 'Waiting for services...' &&
+        python -c 'import time; time.sleep(10)' &&
+        echo 'Starting Celery worker...' &&
+        celery -A app.workers.celery_app worker --loglevel=info --concurrency=2 --max-tasks-per-child=50
+      "
+    networks:
+      - legal-review-network
+
+  # Celery Flower (Monitoring UI)
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: legal-review-flower
+    ports:
+      - "5559:5555"  # Custom port to avoid conflicts
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      FLOWER_PORT: 5555
+    depends_on:
+      - redis
+      - celery_worker
+    command: celery -A app.workers.celery_app flower --port=5555
+    networks:
+      - legal-review-network
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: legal-review-frontend
+    ports:
+      - "3004:3000"  # Custom port to avoid conflicts
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8004/api/v1}
+      NODE_ENV: ${NODE_ENV:-development}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+    command: npm run dev
+    networks:
+      - legal-review-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  uploads_data:
+    driver: local
+
+networks:
+  legal-review-network:
+    driver: bridge
