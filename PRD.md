@@ -632,6 +632,66 @@ Response: 200 OK
 - **Fallback:** Groq API (Llama 3.1)
 - **Future:** Ollama for fully local deployment
 
+#### Smart Chunking for Large Documents
+For documents >100 pages, implement intelligent chunking:
+```python
+def smart_chunk_document(doc_text: str, max_tokens: int = 30000):
+    """Split document at section boundaries, not arbitrary tokens"""
+    sections = extract_sections(doc_text)  # Use PDF bookmarks or heading detection
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    
+    for section in sections:
+        section_size = count_tokens(section)
+        if current_size + section_size > max_tokens:
+            chunks.append("\n\n".join(current_chunk))
+            current_chunk = [section]
+            current_size = section_size
+        else:
+            current_chunk.append(section)
+            current_size += section_size
+    
+    return chunks
+```
+
+#### Field-Specific Prompts
+Different fields need different extraction strategies:
+
+**For Dates:**
+```python
+date_prompt = """
+Extract the {field_name} from this contract.
+Look for phrases like: "Effective Date", "Commencement Date", "Start Date"
+Format: YYYY-MM-DD
+If multiple dates found, return the earliest one as the effective date.
+Confidence: HIGH if explicitly labeled, MEDIUM if inferred from context.
+"""
+```
+
+**For Monetary Amounts:**
+```python
+amount_prompt = """
+Extract {field_name} (contract value, payment amount, etc.).
+- Include currency symbol and amount
+- Normalize to standard format: USD 1,000,000.00
+- If range given (e.g., $1M-$2M), extract the maximum
+- Confidence: HIGH if exact number, MEDIUM if "approximately"
+"""
+```
+
+**For Legal Entities (Parties):**
+```python
+parties_prompt = """
+Extract all contracting parties.
+- Include full legal names (not abbreviations)
+- Format: "Party A, Party B"
+- Distinguish between primary parties and guarantors/witnesses
+- Look in: first page, signature blocks, "BETWEEN" clauses
+Confidence: HIGH if in standard "BETWEEN X AND Y" format
+"""
+```
+
 #### Prompt Engineering
 
 **System Prompt Template:**
@@ -685,14 +745,245 @@ parser = PydanticOutputParser(pydantic_object=ExtractedField)
 ```
 
 #### Confidence Scoring
-- **High (>0.9):** Direct match with clear citation
-- **Medium (0.7-0.9):** Inferred or paraphrased
+**Automated Confidence Calculation:**
+```python
+def calculate_confidence(field_value: str, context: dict) -> float:
+    """
+    Multi-factor confidence scoring
+    """
+    base_confidence = 0.5
+    
+    # Factor 1: Explicit label match (+0.3)
+    if has_explicit_label(context['text_snippet'], field_name):
+        base_confidence += 0.3
+    
+    # Factor 2: Multiple occurrences consistency (+0.2)
+    occurrences = find_all_occurrences(document, field_value)
+    if len(occurrences) > 1 and all_consistent(occurrences):
+        base_confidence += 0.2
+    
+    # Factor 3: Validation rules pass (+0.1)
+    if passes_validation(field_value, field_type):
+        base_confidence += 0.1
+    
+    # Factor 4: Position in document (+0.1)
+    if is_in_expected_location(context['page'], field_type):
+        base_confidence += 0.1
+    
+    # Penalty: Ambiguous wording (-0.2)
+    if contains_ambiguous_terms(context['text_snippet']):
+        base_confidence -= 0.2
+    
+    return min(max(base_confidence, 0.0), 1.0)
+```
+
+**Confidence Levels:**
+- **High (>0.9):** Direct match with clear citation, passes validation
+- **Medium (0.7-0.9):** Inferred or paraphrased, contextually correct
 - **Low (<0.7):** Ambiguous or multiple possible values
+- **None (0.0):** Field not found in document
 
 #### Citation Extraction
-- Track page numbers, section headers, paragraph indices
-- Store text snippet (50 chars before/after)
-- Enable clickable links in UI to jump to source
+**Enhanced Citation System:**
+```python
+class Citation(BaseModel):
+    page_number: int
+    section_title: Optional[str]  # e.g., "Article 5: Payment Terms"
+    paragraph_index: int  # 0-indexed paragraph on page
+    text_snippet: str  # 100 chars before/after match
+    start_char: int  # Character offset in full document
+    end_char: int
+    match_type: Literal["exact", "semantic", "inferred"]
+
+def extract_citation(doc: Document, field_value: str) -> List[Citation]:
+    """
+    Advanced citation extraction with PDF coordinate tracking
+    """
+    citations = []
+    
+    # Method 1: Exact text match
+    for page_num, page_text in enumerate(doc.pages):
+        if field_value in page_text:
+            snippet = extract_context(page_text, field_value, window=100)
+            section = find_nearest_heading(page_text, field_value)
+            citations.append(Citation(
+                page_number=page_num + 1,
+                section_title=section,
+                text_snippet=snippet,
+                match_type="exact"
+            ))
+    
+    # Method 2: Semantic similarity for paraphrased content
+    if not citations:
+        similar_passages = find_similar_text(doc, field_value, threshold=0.85)
+        for passage in similar_passages:
+            citations.append(Citation(
+                page_number=passage.page,
+                text_snippet=passage.text,
+                match_type="semantic"
+            ))
+    
+    return citations
+```
+
+**UI Features:**
+- Clickable citations that highlight source text
+- Thumbnail preview of cited page
+- "Jump to source" button opens PDF viewer at exact location
+
+---
+
+## 🛡️ AI Reliability & Error Handling
+
+### Handling AI Failures
+
+#### Retry Logic with Exponential Backoff
+```python
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=60),
+    retry=retry_if_exception_type(RateLimitError)
+)
+async def extract_with_retry(doc_id: str, field_template: dict):
+    """Retry extraction on transient failures"""
+    try:
+        result = await gemini_client.extract(doc_id, field_template)
+        return result
+    except RateLimitError:
+        logger.warning(f"Rate limit hit for doc {doc_id}, retrying...")
+        raise  # Trigger retry
+    except Exception as e:
+        logger.error(f"Extraction failed: {e}")
+        # Fallback to Groq API
+        return await groq_client.extract(doc_id, field_template)
+```
+
+#### Graceful Degradation
+```python
+class ExtractionStrategy:
+    """Fallback chain for AI extraction"""
+    
+    async def extract(self, document: Document) -> ExtractedRecord:
+        strategies = [
+            ("Gemini 1.5 Flash", self.gemini_extract),
+            ("Groq Llama 3.1", self.groq_extract),
+            ("Rule-based extraction", self.regex_extract),
+        ]
+        
+        for strategy_name, extract_fn in strategies:
+            try:
+                result = await extract_fn(document)
+                result.extraction_method = strategy_name
+                return result
+            except Exception as e:
+                logger.warning(f"{strategy_name} failed: {e}")
+                continue
+        
+        # All strategies failed
+        return ExtractedRecord(
+            status="FAILED",
+            error="All extraction methods exhausted"
+        )
+```
+
+### Quality Checks
+
+#### Post-Extraction Validation
+```python
+def validate_extraction(extracted: ExtractedRecord) -> ValidationResult:
+    """Sanity checks after AI extraction"""
+    issues = []
+    
+    # Check 1: Required fields present
+    required_fields = get_required_fields(extracted.field_template)
+    missing = [f for f in required_fields if not extracted.has_field(f)]
+    if missing:
+        issues.append(f"Missing required fields: {missing}")
+    
+    # Check 2: Date logic (effective_date < end_date)
+    if extracted.has("effective_date") and extracted.has("end_date"):
+        if parse_date(extracted.effective_date) > parse_date(extracted.end_date):
+            issues.append("Effective date is after end date")
+            extracted.confidence("effective_date") *= 0.5  # Reduce confidence
+    
+    # Check 3: Currency format validation
+    if extracted.has("contract_value"):
+        if not is_valid_currency(extracted.contract_value):
+            issues.append("Invalid currency format")
+    
+    # Check 4: Cross-field consistency
+    parties = extracted.get("parties", "")
+    if "signature" in extracted.fields:
+        # Check if signatories match party names
+        if not parties_match_signatures(parties, extracted.signature):
+            issues.append("Parties don't match signature block")
+    
+    return ValidationResult(
+        is_valid=len(issues) == 0,
+        issues=issues,
+        needs_human_review=len(issues) > 2
+    )
+```
+
+#### Confidence Threshold Actions
+```python
+# Auto-route low confidence fields for human review
+LOW_CONFIDENCE_THRESHOLD = 0.7
+
+async def post_extraction_routing(record: ExtractedRecord):
+    """Automatically flag fields needing review"""
+    for field in record.extracted_fields:
+        if field.confidence < LOW_CONFIDENCE_THRESHOLD:
+            # Create review task
+            await create_review_task(
+                field_id=field.id,
+                priority="HIGH" if field.is_required else "NORMAL",
+                reason=f"Low confidence: {field.confidence:.2f}"
+            )
+            
+            # Send notification
+            await notify_reviewer(
+                message=f"Field '{field.name}' needs review",
+                document=record.document_id
+            )
+```
+
+### Rate Limit Management
+
+#### Smart Request Batching
+```python
+class RateLimitedExtractor:
+    """Manage API rate limits for free tier"""
+    
+    def __init__(self):
+        self.daily_limit = 1500  # Gemini free tier
+        self.requests_today = 0
+        self.reset_time = datetime.now() + timedelta(days=1)
+    
+    async def extract_batch(self, documents: List[Document]):
+        """Process documents respecting rate limits"""
+        remaining = self.daily_limit - self.requests_today
+        
+        if remaining <= 0:
+            # Wait until reset or use fallback
+            wait_seconds = (self.reset_time - datetime.now()).seconds
+            if wait_seconds < 3600:  # Less than 1 hour
+                await asyncio.sleep(wait_seconds)
+            else:
+                # Use Groq fallback
+                return await self.groq_extract_batch(documents)
+        
+        # Process in batches to stay under limit
+        batch_size = min(remaining, len(documents))
+        processed = await self.gemini_extract_batch(documents[:batch_size])
+        self.requests_today += batch_size
+        
+        # Queue remaining for later
+        if len(documents) > batch_size:
+            await queue_for_later(documents[batch_size:])
+        
+        return processed
+```
 
 ---
 

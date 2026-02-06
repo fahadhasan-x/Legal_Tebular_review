@@ -69,9 +69,17 @@ A **production-ready full-stack AI system** that automatically extracts structur
 - **Google Gemini 1.5 Flash** - Primary extraction (FREE tier: 1500 req/day)
 - **Groq API (Llama 3.1)** - Fallback option (FREE)
 - **LangChain** - LLM orchestration & structured output
-- **PyPDF2 + pdfplumber** - PDF parsing
+- **PyPDF2 + pdfplumber** - PDF parsing with text + layout extraction
 - **python-docx** - DOCX parsing
-- **BeautifulSoup4** - HTML parsing
+- **BeautifulSoup4 + lxml** - HTML parsing
+
+**AI Features:**
+- ✅ Field-specific extraction prompts (dates, amounts, parties)
+- ✅ Multi-factor confidence scoring (0.0-1.0)
+- ✅ Advanced citation tracking (page + section + snippet)
+- ✅ Retry logic with exponential backoff
+- ✅ Rate limit management (1500 req/day free tier)
+- ✅ Graceful degradation (Gemini → Groq → Regex fallback)
 
 ### Frontend
 - **Next.js 14** - React framework with App Router
